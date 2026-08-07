@@ -1,25 +1,19 @@
 name: Craigslist Gig Monitor
-
 on:
   schedule:
-    - cron: "0 * * * *"   # every hour, on the hour (UTC)
-  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
-
+    - cron: "0 */3 * * *"   # every 3 hours (was hourly — GH IPs get throttled)
+  workflow_dispatch: {}    # lets you trigger manually
 permissions:
-  contents: write   # needed so the workflow can commit seen.json back
-
+  contents: write
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - run: pip install -r requirements.txt
-
       - name: Run monitor
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -27,7 +21,6 @@ jobs:
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
           ALERT_SMS_GATEWAY: ${{ secrets.ALERT_SMS_GATEWAY }}
         run: python monitor.py
-
       - name: Commit updated seen-state
         run: |
           git config user.name "gig-monitor-bot"
