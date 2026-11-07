@@ -74,9 +74,33 @@ BUYER = [
     r"shop|app|business|company)\b", r"\bcan (someone|anyone)\b", r"\bwho can\b", r"\bhire (a|an)\b",
 ]
 
+# Body checks. The broad SELLER/JOB lists above would drop real buyers whose
+# description says things like "affordable" or "our team", so the body is
+# checked against narrower patterns that only a pitch or a job ad uses. A hit
+# here drops the post even when the title or body also has buyer words.
+_WEB = r"(web\s?sites?|sites|web apps?|apps|landing pages|seo|online stores|stores|chat\s?bots)"
+BODY_SELLER = [
+    r"\b(we|i) (build|rebuild|design|develop|create|make|offer|fix) ([\w-]+ ){0,2}" + _WEB + r"\b",
+    r"\b(we|i) specialize\b", r"\bhire me\b", r"\b(my|our) services\b",
+    r"\byour (business|website|site|company|customers|clients|brand)\b",
+    r"\baward[- ]winning\b", r"\b\d+\+? ?(yrs|years) (of )?experience\b",
+    r"\bno obligation\b", r"\bcomplimentary\b", r"\blink in footer\b", r"\btired of\b",
+    r"\bfree (website|web site|site|mockup|quote|consultation|audit|build)\b",
+    r"\b(need|want)(s)? (a|an|more) [\w\s-]{0,25}\?",
+]
+BODY_JOB = [
+    r"\btesters?\b", r"\bpaid (study|test|survey|research)\b", r"\brater\b", r"\bsurvey\b",
+    r"\bparticipants?\b", r"\bfocus group\b", r"\bwriters?\b", r"\bappointment setter\b",
+    r"\bvirtual assistant\b", r"\breferral (partner|fee|broker)\b", r"\blead generator\b",
+    r"\bcommission\b", r"\$\s?\d+\s?(/|per)\s?h(ou)?r", r"\bpart[- ]time\b", r"\bfull[- ]time\b",
+    r"\bjoin our team\b",
+]
+
 SELLER_RE = [re.compile(p) for p in SELLER]
 JOB_RE = [re.compile(p) for p in JOB]
 BUYER_RE = [re.compile(p) for p in BUYER]
+BODY_SELLER_RE = [re.compile(p) for p in BODY_SELLER]
+BODY_JOB_RE = [re.compile(p) for p in BODY_JOB]
 
 EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿]")
 
@@ -128,6 +152,16 @@ def classify(title, body=""):
     if not TOPIC.search(t) and not TOPIC.search(b):
         return {"tier": None, "reason": "off-topic"}
 
+    # Body exclusions run before any buyer verdict, so "Need a website? We
+    # build sites for your business" or "We need testers" never pass.
+    if b:
+        hit = _first(BODY_JOB_RE, b)
+        if hit:
+            return {"tier": None, "reason": f"job post: body /{hit}/"}
+        hit = _first(BODY_SELLER_RE, b)
+        if hit:
+            return {"tier": None, "reason": f"seller ad: body /{hit}/"}
+
     if _first(BUYER_RE, t):
         return {"tier": "hot", "reason": "buyer voice in title"}
 
@@ -144,6 +178,16 @@ def is_lead(title, body=""):
     return classify(title, body)["tier"] is not None
 
 
-def dedupe_key(title):
-    """Same ad cross-posted to many cities collapses to one entry."""
-    return re.sub(r"[^a-z0-9]+", " ", _norm(title)).strip()
+def _plain(text):
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"[^a-z0-9]+", " ", _norm(text)).strip()
+
+
+def dedupe_key(title, body=""):
+    """Same ad cross-posted to many cities collapses to one entry.
+
+    The description is part of the key, so two different people who both post
+    "Website Needed" stay separate. Cross-posts copy the same text, so they
+    still collapse.
+    """
+    return _plain(title) + "|" + _plain(body)[:200]
