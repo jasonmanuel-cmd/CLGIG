@@ -66,6 +66,10 @@ email + text alert.
 ## Files
 
 - `monitor.py` — the actual check-and-alert logic
+- `leadfilter.py` — buyer-intent filter: drops other sellers' ads and
+  job/gig-worker posts so only people needing work done get alerted
+- `test_leadfilter.py` — regression test built from real digest titles;
+  the workflow runs it before every check
 - `data/cities.json` — the 247 markets it watches
 - `data/seen.json` — state file (auto-created/updated by the workflow)
 - `.github/workflows/monitor.yml` — the hourly schedule
