@@ -112,12 +112,38 @@ def main():
     if r["tier"]:
         failures.append(f"body pitch passed: {r}")
 
-    if dedupe_key("Free website build!") != dedupe_key("FREE Website Build"):
+    # Body pitch or job wording beats buyer words anywhere (PR 1 review).
+    body_rejects = [
+        ("Web site development", "Need a website? We build sites for your business. Call us today."),
+        ("Web site development", "We need website testers for a paid study."),
+        ("Website Needed", "We design custom websites for your business, 10 years experience."),
+        ("Need help with my website", "Join our team! $25/hr part-time, remote."),
+    ]
+    for title, body in body_rejects:
+        r = classify(title, body)
+        if r["tier"]:
+            failures.append(f"body exclusion missed: {title!r} / {body!r} ({r['reason']})")
+    # Real buyers whose bodies use words the broad seller list would catch.
+    body_keeps = [
+        ("Web site needed", "We build custom homes and need a website for the business. Affordable please."),
+        ("Website help", "Our team needs someone experienced to fix our WordPress site."),
+        ("Web site development", "I need a simple site for my bakery. Are you available this week?"),
+    ]
+    for title, body in body_keeps:
+        r = classify(title, body)
+        if not r["tier"]:
+            failures.append(f"buyer body dropped: {title!r} / {body!r} ({r['reason']})")
+
+    if dedupe_key("Free website build!", "Same text.") != dedupe_key("FREE Website Build", "Same text."):
         failures.append("dedupe_key does not collapse cross-posts")
+    if dedupe_key("Website Needed", "Need a site for my bakery in Reno.") == dedupe_key(
+            "Website Needed", "Looking for someone to redo our church website."):
+        failures.append("dedupe_key merges different buyers with the same title")
 
     for f in failures:
         print("FAIL", f)
-    total = len(REAL_NON_LEADS) + len(SYNTHETIC_SELLERS) + len(REAL_BUYERS) + len(SYNTHETIC_BUYERS) + 3
+    total = (len(REAL_NON_LEADS) + len(SYNTHETIC_SELLERS) + len(REAL_BUYERS) + len(SYNTHETIC_BUYERS)
+             + 3 + len(body_rejects) + len(body_keeps) + 1)
     print(f"{total - len(failures)}/{total} checks passed")
     return 1 if failures else 0
 
