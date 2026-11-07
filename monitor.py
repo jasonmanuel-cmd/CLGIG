@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Craigslist Computer Gigs Monitor — Patched for GitHub IP throttling
+- Only emails posts that read like a buyer (see leadfilter.py); other
+  agencies' ads and job/gig-worker posts are dropped and logged
 - Slower delay (4s) + every 3 hours so Craigslist doesn't block datacenter IPs
 - Verbose logging so you can see why seen.json was staying {}
 - Still uses data/cities.json → data/seen.json → Resend email/SMS
@@ -13,6 +15,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
+
+from leadfilter import classify, dedupe_key
 
 ROOT = Path(__file__).parent
 CITIES_FILE = ROOT / "data" / "cities.json"
@@ -57,11 +61,13 @@ def fetch_feed(slug):
             guid_el = item.find("guid")
             title_el = item.find("title")
             link_el = item.find("link")
+            desc_el = item.find("description")
             guid = guid_el.text.strip() if guid_el is not None and guid_el.text else None
             title = title_el.text.strip() if title_el is not None and title_el.text else "(no title)"
             link = link_el.text.strip() if link_el is not None and link_el.text else url
+            desc = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
             if guid:
-                items.append((guid, title, link))
+                items.append((guid, title, link, desc))
         print(f"  {slug}: {len(items)} posts")
         return items
     except (requests.RequestException, ET.ParseError) as e:
@@ -122,10 +128,10 @@ def main():
             continue
         seen_ids = set(seen.get(slug, []))
         current_ids = set()
-        for guid, title, link in items:
+        for guid, title, link, desc in items:
             current_ids.add(guid)
             if guid not in seen_ids:
-                new_posts.append({"city": name, "slug": slug, "title": title, "link": link})
+                new_posts.append({"city": name, "slug": slug, "title": title, "link": link, "desc": desc})
         seen[slug] = list(current_ids)[-300:]
         if idx % 20 == 0:
             print(f"  ... progress {idx}/{len(cities)}, new so far: {len(new_posts)}, blocked: {blocked}")
@@ -138,14 +144,36 @@ def main():
         return 0
 
     print(f"{len(new_posts)} new post(s) found.")
+
+    # Keep buyers only, and collapse the same ad cross-posted to many cities.
+    leads, dropped, dupes = [], {}, set()
+    for p in new_posts:
+        key = dedupe_key(p["title"])
+        if key in dupes:
+            continue
+        dupes.add(key)
+        verdict = classify(p["title"], p.get("desc", ""))
+        if verdict["tier"]:
+            p["tier"] = verdict["tier"]
+            leads.append(p)
+        else:
+            kind = verdict["reason"].split(":")[0]
+            dropped[kind] = dropped.get(kind, 0) + 1
+    print(f"Leads after filter: {len(leads)}; dropped: {dropped}")
+    if not leads:
+        print("No buyer posts this run, no email sent.")
+        return 0
+    leads.sort(key=lambda p: p["tier"] != "hot")
+    new_posts = leads
     rows = "".join(
         f'<tr><td style="padding:6px 10px;border-bottom:1px solid #333;">{p["city"]}</td>'
+        f'<td style="padding:6px 10px;border-bottom:1px solid #333;">{p["tier"].upper()}</td>'
         f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{p["link"]}">{p["title"]}</a></td></tr>'
         for p in new_posts)
-    html_body = f"<h2>{len(new_posts)} new Craigslist computer gig post(s)</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Post</th></tr>{rows}</table>"
-    send_email(f"COAI Gig Monitor: {len(new_posts)} new post(s)", html_body)
+    html_body = f"<h2>{len(new_posts)} buyer post(s) on Craigslist computer gigs</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Tier</th><th style=\"text-align:left;padding:6px 10px;\">Post</th></tr>{rows}</table>"
+    send_email(f"COAI Gig Monitor: {len(new_posts)} buyer post(s)", html_body)
     top = new_posts[:3]
-    sms_lines = [f"{len(new_posts)} new gig post(s)."] + [f"{p['city']}: {p['title'][:40]}" for p in top]
+    sms_lines = [f"{len(new_posts)} buyer post(s)."] + [f"{p['city']}: {p['title'][:40]}" for p in top]
     send_sms(" | ".join(sms_lines))
     return 0
 
