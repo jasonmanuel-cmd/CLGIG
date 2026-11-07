@@ -148,7 +148,7 @@ def main():
     # Keep buyers only, and collapse the same ad cross-posted to many cities.
     leads, dropped, dupes = [], {}, set()
     for p in new_posts:
-        key = dedupe_key(p["title"])
+        key = dedupe_key(p["title"], p.get("desc", ""))
         if key in dupes:
             continue
         dupes.add(key)
