@@ -5,6 +5,7 @@ Craigslist Computer Gigs Monitor — Patched for GitHub IP throttling
   agencies' ads and job/gig-worker posts are dropped and logged
 - Slower delay (4s) + every 3 hours so Craigslist doesn't block datacenter IPs
 - Verbose logging so you can see why seen.json was staying {}
+- Reads Craigslist's search JSON (the RSS feed stopped answering)
 - Still uses data/cities.json → data/seen.json → Resend email/SMS
 - seen.json keeps {post id: first seen} per city for 60 days, plus the text
   keys of posts already emailed, so old and cross-posted ads never repeat
@@ -14,7 +15,6 @@ import json
 import os
 import sys
 import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import requests
@@ -72,34 +72,73 @@ def save_json(path, data):
     path.write_text(json.dumps(data, indent=2))
     print(f"Saved {path} with {len(data)} city entries")
 
+SEARCH_URL = ("https://sapi.craigslist.org/web/v8/postings/search/full"
+              "?batch={area}-0-360-0-0&cc=US&lang=en&searchPath=cpg")
+AREAS_URL = "https://reference.craigslist.org/Areas"
+_AREA_IDS = None
+
+
+def area_ids():
+    """Hostname -> Craigslist area id, e.g. bakersfield -> 63. Fetched once per run."""
+    global _AREA_IDS
+    if _AREA_IDS is None:
+        _AREA_IDS = {}
+        try:
+            resp = requests.get(AREAS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            for a in resp.json():
+                if a.get("Hostname") and a.get("AreaID") is not None:
+                    _AREA_IDS[a["Hostname"]] = int(a["AreaID"])
+            print(f"Loaded {len(_AREA_IDS)} Craigslist area ids")
+        except (requests.RequestException, ValueError) as e:
+            print(f"ERROR: could not load Craigslist area ids: {e}")
+    return _AREA_IDS
+
+
+def parse_search(payload):
+    """Turn Craigslist's search JSON into (guid, title, link, desc) tuples.
+
+    The old ?format=rss feed no longer answers, so this reads the JSON the
+    craigslist.org search page itself loads. Each item is an array: [0] is the
+    posting id minus data.decode.minPostingId, tagged arrays [6, slug] and
+    [13, token] build the post link, [7, text] is the pay, and the last
+    element is the title. The search results carry no description.
+    """
+    data = (payload or {}).get("data") or {}
+    base_id = (data.get("decode") or {}).get("minPostingId") or 0
+    items = []
+    for it in data.get("items") or []:
+        if not isinstance(it, list) or not it:
+            continue
+        tags = {x[0]: x[1] for x in it if isinstance(x, list) and len(x) == 2}
+        title = it[-1] if isinstance(it[-1], str) else None
+        slug, token = tags.get(6), tags.get(13)
+        if not (title and slug and token) or not isinstance(it[0], int):
+            continue
+        guid = str(base_id + it[0])
+        link = f"https://www.craigslist.org/view/d/{slug}/{token}"
+        items.append((guid, title.strip(), link, ""))
+    return items
+
+
 def fetch_feed(slug):
-    url = f"https://{slug}.craigslist.org/search/cpg?format=rss"
+    area = area_ids().get(slug)
+    if area is None:
+        print(f"  {slug}: no Craigslist area id")
+        return None
+    url = SEARCH_URL.format(area=area)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             print(f"  {slug}: HTTP {resp.status_code}")
             return None
-        if not resp.content:
-            print(f"  {slug}: empty response")
-            return None
-        root = ET.fromstring(resp.content)
-        items = []
-        for item in root.iter("item"):
-            guid_el = item.find("guid")
-            title_el = item.find("title")
-            link_el = item.find("link")
-            desc_el = item.find("description")
-            guid = guid_el.text.strip() if guid_el is not None and guid_el.text else None
-            title = title_el.text.strip() if title_el is not None and title_el.text else "(no title)"
-            link = link_el.text.strip() if link_el is not None and link_el.text else url
-            desc = desc_el.text.strip() if desc_el is not None and desc_el.text else ""
-            if guid:
-                items.append((guid, title, link, desc))
+        items = parse_search(resp.json())
         print(f"  {slug}: {len(items)} posts")
         return items
-    except (requests.RequestException, ET.ParseError) as e:
+    except (requests.RequestException, ValueError) as e:
         print(f"  {slug}: error {e}")
         return None
+
 
 def send_email(subject, html_body):
     if not (RESEND_API_KEY and ALERT_EMAIL):
