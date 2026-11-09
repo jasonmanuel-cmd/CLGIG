@@ -6,7 +6,10 @@ Craigslist Computer Gigs Monitor — Patched for GitHub IP throttling
 - Slower delay (4s) + every 3 hours so Craigslist doesn't block datacenter IPs
 - Verbose logging so you can see why seen.json was staying {}
 - Still uses data/cities.json → data/seen.json → Resend email/SMS
+- seen.json keeps {post id: first seen} per city for 60 days, plus the text
+  keys of posts already emailed, so old and cross-posted ads never repeat
 """
+import html
 import json
 import os
 import sys
@@ -30,6 +33,30 @@ ALERT_SMS_GATEWAY = os.environ.get("ALERT_SMS_GATEWAY")
 REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 4.0  # bumped from 1.5 to avoid Craigslist throttling GH Actions IPs
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; COAI-GigMonitor/1.0)"}
+SEEN_DAYS = 60  # forget a post this many days after we first saw it (gig posts expire sooner)
+KEYS = "_alerted"  # dedupe keys already emailed, so cross-posts never repeat
+
+
+def _now():
+    return int(time.time())
+
+
+def normalize_seen(seen):
+    """Old seen.json stored a list of ids per city; now it is {id: first_seen}."""
+    out = {}
+    for slug, val in (seen or {}).items():
+        if isinstance(val, dict):
+            out[slug] = {k: int(v) for k, v in val.items()}
+        elif isinstance(val, list):
+            out[slug] = {k: _now() for k in val}
+    return out
+
+
+def prune_seen(seen, now=None):
+    cutoff = (now or _now()) - SEEN_DAYS * 86400
+    for slug in list(seen):
+        seen[slug] = {k: t for k, t in seen[slug].items() if t >= cutoff}
+    return seen
 
 def load_json(path, default):
     if path.exists():
@@ -96,12 +123,13 @@ def send_sms(text_body):
 
 def main():
     cities = load_json(CITIES_FILE, [])
-    seen = load_json(SEEN_FILE, {})
+    seen = prune_seen(normalize_seen(load_json(SEEN_FILE, {})))
+    alerted = seen.pop(KEYS, {})
     print(f"Loaded {len(cities)} cities from {CITIES_FILE}, {len(seen)} cities in seen.json")
 
     if not cities:
         print("ERROR: No cities loaded — check data/cities.json exists and is valid JSON")
-        # still write empty seen to make job succeed
+        seen[KEYS] = alerted
         save_json(SEEN_FILE, seen)
         return 0
 
@@ -123,59 +151,77 @@ def main():
             continue
         if len(items) == 0:
             empty += 1
-            # still mark as seen with empty list so we don't refetch infinitely
-            seen[slug] = []
+            seen.setdefault(slug, {})
             continue
-        seen_ids = set(seen.get(slug, []))
-        current_ids = set()
+        first_visit = slug not in seen
+        city_seen = seen.setdefault(slug, {})
         for guid, title, link, desc in items:
-            current_ids.add(guid)
-            if guid not in seen_ids:
+            if guid in city_seen:
+                continue
+            city_seen[guid] = _now()
+            # First visit to a city only records what is already up, so a fresh
+            # or reset seen.json never floods the inbox with old posts.
+            if not first_visit:
                 new_posts.append({"city": name, "slug": slug, "title": title, "link": link, "desc": desc})
-        seen[slug] = list(current_ids)[-300:]
         if idx % 20 == 0:
             print(f"  ... progress {idx}/{len(cities)}, new so far: {len(new_posts)}, blocked: {blocked}")
 
     print(f"Done: checked {len(cities)}, blocked/no-feed: {blocked}, empty feeds: {empty}, total seen cities now: {len(seen)}")
-    save_json(SEEN_FILE, seen)
 
+    leads = pick_leads(new_posts, alerted)
+    seen[KEYS] = alerted
+    save_json(SEEN_FILE, seen)
     if not new_posts:
         print("No new posts this run.")
         return 0
-
     print(f"{len(new_posts)} new post(s) found.")
+    if not leads:
+        print("No buyer posts this run, no email sent.")
+        return 0
+    send_digest(leads)
+    return 0
 
-    # Keep buyers only, and collapse the same ad cross-posted to many cities.
-    leads, dropped, dupes = [], {}, set()
+
+def pick_leads(new_posts, alerted):
+    """Keep buyers only. A post whose text was already emailed (same ad
+    cross-posted to another city, now or in an earlier run) is skipped."""
+    leads, dropped = [], {}
     for p in new_posts:
         key = dedupe_key(p["title"], p.get("desc", ""))
-        if key in dupes:
+        if key in alerted:
+            dropped["already sent"] = dropped.get("already sent", 0) + 1
             continue
-        dupes.add(key)
         verdict = classify(p["title"], p.get("desc", ""))
         if verdict["tier"]:
+            alerted[key] = _now()
             p["tier"] = verdict["tier"]
             leads.append(p)
         else:
             kind = verdict["reason"].split(":")[0]
             dropped[kind] = dropped.get(kind, 0) + 1
+    cutoff = _now() - SEEN_DAYS * 86400
+    for k in [k for k, t in alerted.items() if t < cutoff]:
+        del alerted[k]
     print(f"Leads after filter: {len(leads)}; dropped: {dropped}")
-    if not leads:
-        print("No buyer posts this run, no email sent.")
-        return 0
     leads.sort(key=lambda p: p["tier"] != "hot")
-    new_posts = leads
+    return leads
+
+
+def _safe_link(link):
+    return link if isinstance(link, str) and link.startswith("https://") else "#"
+
+
+def send_digest(new_posts):
     rows = "".join(
-        f'<tr><td style="padding:6px 10px;border-bottom:1px solid #333;">{p["city"]}</td>'
+        f'<tr><td style="padding:6px 10px;border-bottom:1px solid #333;">{html.escape(p["city"])}</td>'
         f'<td style="padding:6px 10px;border-bottom:1px solid #333;">{p["tier"].upper()}</td>'
-        f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{p["link"]}">{p["title"]}</a></td></tr>'
+        f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{html.escape(_safe_link(p["link"]))}">{html.escape(p["title"])}</a></td></tr>'
         for p in new_posts)
     html_body = f"<h2>{len(new_posts)} buyer post(s) on Craigslist computer gigs</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Tier</th><th style=\"text-align:left;padding:6px 10px;\">Post</th></tr>{rows}</table>"
     send_email(f"COAI Gig Monitor: {len(new_posts)} buyer post(s)", html_body)
     top = new_posts[:3]
     sms_lines = [f"{len(new_posts)} buyer post(s)."] + [f"{p['city']}: {p['title'][:40]}" for p in top]
     send_sms(" | ".join(sms_lines))
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())
