@@ -1,0 +1,10 @@
+{"apiVersion": 8, "data": {
+  "areas": {"63": {"name": "bakersfield"}},
+  "decode": {"minPostingId": 7981612869, "minPostedDate": 1791713130,
+             "locations": [0, [63, "bakersfield"], [103, "orangecounty"]]},
+  "totalResultCount": 3,
+  "items": [
+    [13656531, 2109349, 110, -1, "1:0~35.3863~-119.17", 0, -3, [13, "pFj49JDuWsS8HbrnrcMxj6"], [6, "bakersfield-paid-study-test-ai-earn-up"], [7, "$600"], "Paid Study | Test AI & Earn Up to $600 | Remote"],
+    [9941187, 1511362, 110, -1, "1:1~35.3866~-119.0171", "0wg0lv", [13, "5L68WoyHJ9MLG4GdtNqvDH"], [4, "3:00C0C_bHN4KHMfWK_0wg0lv"], [6, "bakersfield-website-needed"], [7, "$500"], "Website Needed"],
+    [123, 456, 110, -1, "1:0~0~0", 0, [7, "$5"], "Item with no slug or token"]
+  ]}, "errors": []}

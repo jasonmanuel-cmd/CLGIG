@@ -84,9 +84,26 @@ def main():
     if "<script>" in captured.get("body", "") or "javascript:" in captured.get("body", ""):
         failures.append("email body does not escape titles or bad links")
 
+    # Craigslist search JSON parses into posts with ids, titles and links.
+    # The sample is shaped like a real sapi response for Bakersfield (Nov 9 2026),
+    # abridged, with one title changed to a buyer post. The first item's id and
+    # link were checked against its live post page (post id 7995269400).
+    sample = json.loads((Path(__file__).parent / "tests" / "sapi_bakersfield_sample.json").read_text())
+    posts = real.parse_search(sample)
+    expect = [
+        ("7995269400", "Paid Study | Test AI & Earn Up to $600 | Remote",
+         "https://www.craigslist.org/view/d/bakersfield-paid-study-test-ai-earn-up/pFj49JDuWsS8HbrnrcMxj6", ""),
+        ("7991554056", "Website Needed",
+         "https://www.craigslist.org/view/d/bakersfield-website-needed/5L68WoyHJ9MLG4GdtNqvDH", ""),
+    ]
+    if posts != expect:
+        failures.append(f"parse_search gave {posts}")
+    if real.parse_search({}) != [] or real.parse_search({"data": {"items": [["junk"]]}}) != []:
+        failures.append("parse_search does not tolerate empty or junk payloads")
+
     for f in failures:
         print("FAIL", f)
-    total = 7
+    total = 9
     print(f"{total - len(failures)}/{total} checks passed")
     return 1 if failures else 0
 
