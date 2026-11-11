@@ -24,6 +24,8 @@ jobs:
           ALERT_SMS_GATEWAY: ${{ secrets.ALERT_SMS_GATEWAY }}
         run: python monitor.py
       - name: Commit updated seen-state
+        # Runs even when the email failed, so the kept leads are saved for the retry.
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "gig-monitor-bot"
           git config user.email "actions@github.com"

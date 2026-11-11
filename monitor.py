@@ -26,7 +26,9 @@ CITIES_FILE = ROOT / "data" / "cities.json"
 SEEN_FILE = ROOT / "data" / "seen.json"
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@coaibakersfield.com")
+# GitHub passes a missing secret as an empty string, so fall back on empty too.
+# onboarding@resend.dev only delivers to the Resend account's own address.
+FROM_EMAIL = (os.environ.get("FROM_EMAIL") or "").strip() or "COAI Gig Monitor <onboarding@resend.dev>"
 ALERT_EMAIL = os.environ.get("ALERT_EMAIL")
 ALERT_SMS_GATEWAY = os.environ.get("ALERT_SMS_GATEWAY")
 
@@ -35,6 +37,7 @@ DELAY_BETWEEN_REQUESTS = 4.0  # bumped from 1.5 to avoid Craigslist throttling G
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; COAI-GigMonitor/1.0)"}
 SEEN_DAYS = 60  # forget a post this many days after we first saw it (gig posts expire sooner)
 KEYS = "_alerted"  # dedupe keys already emailed, so cross-posts never repeat
+PENDING = "_pending"  # leads whose email failed, retried next run
 
 
 def _now():
@@ -143,12 +146,17 @@ def fetch_feed(slug):
 def send_email(subject, html_body):
     if not (RESEND_API_KEY and ALERT_EMAIL):
         print("Email skipped: RESEND_API_KEY or ALERT_EMAIL not set")
-        return
-    resp = requests.post("https://api.resend.com/emails",
-        headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-        json={"from": FROM_EMAIL, "to": [ALERT_EMAIL], "subject": subject, "html": html_body},
-        timeout=REQUEST_TIMEOUT)
+        return False
+    try:
+        resp = requests.post("https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={"from": FROM_EMAIL, "to": [ALERT_EMAIL], "subject": subject, "html": html_body},
+            timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"Email send failed: {e}")
+        return False
     print(f"Email send status: {resp.status_code} {resp.text[:200]}")
+    return 200 <= resp.status_code < 300
 
 def send_sms(text_body):
     if not (RESEND_API_KEY and ALERT_SMS_GATEWAY):
@@ -162,13 +170,21 @@ def send_sms(text_body):
 
 def main():
     cities = load_json(CITIES_FILE, [])
-    seen = prune_seen(normalize_seen(load_json(SEEN_FILE, {})))
+    raw = load_json(SEEN_FILE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    pending = raw.pop(PENDING, [])  # a list of lead dicts, not a city
+    if not isinstance(pending, list):
+        pending = []
+    pending = [p for p in pending if isinstance(p, dict) and p.get("key") and p.get("tier")]
+    seen = prune_seen(normalize_seen(raw))
     alerted = seen.pop(KEYS, {})
     print(f"Loaded {len(cities)} cities from {CITIES_FILE}, {len(seen)} cities in seen.json")
 
     if not cities:
         print("ERROR: No cities loaded — check data/cities.json exists and is valid JSON")
         seen[KEYS] = alerted
+        seen[PENDING] = pending
         save_json(SEEN_FILE, seen)
         return 0
 
@@ -207,33 +223,54 @@ def main():
 
     print(f"Done: checked {len(cities)}, blocked/no-feed: {blocked}, empty feeds: {empty}, total seen cities now: {len(seen)}")
 
-    leads = pick_leads(new_posts, alerted)
-    seen[KEYS] = alerted
-    save_json(SEEN_FILE, seen)
-    if not new_posts:
+    if new_posts:
+        print(f"{len(new_posts)} new post(s) found.")
+    else:
         print("No new posts this run.")
-        return 0
-    print(f"{len(new_posts)} new post(s) found.")
-    if not leads:
+    leads = pick_leads(new_posts, alerted)
+    queued = {p["key"] for p in pending}
+    leads = [p for p in pending if p.get("key") not in alerted] + \
+            [p for p in leads if p["key"] not in queued]
+    leads.sort(key=lambda p: p["tier"] != "hot")
+    for p in leads:
+        print(f"  lead [{p['tier']}] {p['city']}: {p['title']}")
+
+    ok = True
+    if leads:
+        ok = bool(send_digest(leads))
+        if ok:
+            for p in leads:
+                alerted[p["key"]] = _now()
+            pending = []
+        else:
+            cutoff = _now() - SEEN_DAYS * 86400
+            pending = [p for p in leads if p.get("found", _now()) >= cutoff]
+            print(f"ERROR: lead email failed; {len(pending)} lead(s) kept to retry next run")
+    else:
         print("No buyer posts this run, no email sent.")
-        return 0
-    send_digest(leads)
-    return 0
+        pending = []
+    seen[KEYS] = alerted
+    seen[PENDING] = pending
+    save_json(SEEN_FILE, seen)
+    return 0 if ok else 1
 
 
 def pick_leads(new_posts, alerted):
     """Keep buyers only. A post whose text was already emailed (same ad
     cross-posted to another city, now or in an earlier run) is skipped."""
-    leads, dropped = [], {}
+    leads, dropped, batch = [], {}, set()
     for p in new_posts:
         key = dedupe_key(p["title"], p.get("desc", ""))
-        if key in alerted:
+        if key in alerted or key in batch:
             dropped["already sent"] = dropped.get("already sent", 0) + 1
             continue
         verdict = classify(p["title"], p.get("desc", ""))
         if verdict["tier"]:
-            alerted[key] = _now()
+            # Marked as sent only after the email goes out (see main).
+            batch.add(key)
             p["tier"] = verdict["tier"]
+            p["key"] = key
+            p["found"] = _now()
             leads.append(p)
         else:
             kind = verdict["reason"].split(":")[0]
@@ -242,7 +279,6 @@ def pick_leads(new_posts, alerted):
     for k in [k for k, t in alerted.items() if t < cutoff]:
         del alerted[k]
     print(f"Leads after filter: {len(leads)}; dropped: {dropped}")
-    leads.sort(key=lambda p: p["tier"] != "hot")
     return leads
 
 
@@ -257,10 +293,11 @@ def send_digest(new_posts):
         f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{html.escape(_safe_link(p["link"]))}">{html.escape(p["title"])}</a></td></tr>'
         for p in new_posts)
     html_body = f"<h2>{len(new_posts)} buyer post(s) on Craigslist computer gigs</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Tier</th><th style=\"text-align:left;padding:6px 10px;\">Post</th></tr>{rows}</table>"
-    send_email(f"COAI Gig Monitor: {len(new_posts)} buyer post(s)", html_body)
+    ok = send_email(f"COAI Gig Monitor: {len(new_posts)} buyer post(s)", html_body)
     top = new_posts[:3]
     sms_lines = [f"{len(new_posts)} buyer post(s)."] + [f"{p['city']}: {p['title'][:40]}" for p in top]
     send_sms(" | ".join(sms_lines))
+    return ok
 
 if __name__ == "__main__":
     sys.exit(main())
