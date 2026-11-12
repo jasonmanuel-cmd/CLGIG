@@ -19,7 +19,7 @@ def run(feeds, seen_path, cities):
     """One monitor run with fake feeds; returns the leads it would email."""
     sent = []
     monitor.fetch_feed = lambda slug: feeds.get(slug)
-    monitor.send_digest = lambda leads: sent.extend(leads)
+    monitor.send_digest = lambda leads: sent.extend(leads) or True
     monitor.time.sleep = lambda s: None
     monitor.main()
     return sent
@@ -71,6 +71,27 @@ def main():
     if run(feeds, monitor.SEEN_FILE, cities):
         failures.append("old list-style seen.json not honoured")
 
+    # A failed email keeps the lead, fails the run, and sends it next run, once.
+    monitor.SEEN_FILE.write_text(json.dumps({"reno": {}, "fresno": {}}))
+    feeds = {"reno": [item("f1", ("Need a logo and site", "Bakery in Reno."))], "fresno": []}
+    tries = []
+    monitor.fetch_feed = lambda slug: feeds.get(slug)
+    monitor.send_digest = lambda leads: tries.append([p["title"] for p in leads]) or False
+    code = monitor.main()
+    kept = json.loads(monitor.SEEN_FILE.read_text()).get("_pending", [])
+    if code != 1 or [p["title"] for p in kept] != ["Need a logo and site"]:
+        failures.append(f"failed email did not keep the lead or fail the run (exit {code}, kept {kept})")
+    resent = run(feeds, monitor.SEEN_FILE, cities)
+    again = run(feeds, monitor.SEEN_FILE, cities)
+    if [p["title"] for p in resent] != ["Need a logo and site"] or again:
+        failures.append(f"kept lead not sent exactly once after the fix (sent {resent}, then {again})")
+
+    # A missing FROM_EMAIL secret arrives as "" and falls back to a valid sender.
+    import os, importlib
+    os.environ["FROM_EMAIL"] = ""
+    if "@" not in importlib.reload(monitor).FROM_EMAIL:
+        failures.append("empty FROM_EMAIL is not replaced with a valid sender")
+
     # Email body escapes titles.
     captured = {}
     monitor.send_email = lambda subj, body: captured.setdefault("body", body)
@@ -103,7 +124,7 @@ def main():
 
     for f in failures:
         print("FAIL", f)
-    total = 9
+    total = 12
     print(f"{total - len(failures)}/{total} checks passed")
     return 1 if failures else 0
 
