@@ -92,6 +92,14 @@ def main():
     if "@" not in importlib.reload(monitor).FROM_EMAIL:
         failures.append("empty FROM_EMAIL is not replaced with a valid sender")
 
+    # Malformed senders fall back; valid ones are kept as given.
+    good = ["alerts@coai.com", "COAI Alerts <alerts@coai.com>", '"alerts@coai.com"']
+    bad = ["coaibakersfield.com", "alerts@", "COAI Alerts", "<alerts@coai.com", "a b@c.com"]
+    if [monitor.pick_sender(g) for g in good] != ["alerts@coai.com", "COAI Alerts <alerts@coai.com>", "alerts@coai.com"]:
+        failures.append("valid FROM_EMAIL values were not kept")
+    if any(monitor.pick_sender(b) != monitor.DEFAULT_FROM for b in bad):
+        failures.append("malformed FROM_EMAIL values were not replaced")
+
     # Email body escapes titles.
     captured = {}
     monitor.send_email = lambda subj, body: captured.setdefault("body", body)
@@ -124,7 +132,7 @@ def main():
 
     for f in failures:
         print("FAIL", f)
-    total = 12
+    total = 14
     print(f"{total - len(failures)}/{total} checks passed")
     return 1 if failures else 0
 
