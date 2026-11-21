@@ -13,6 +13,7 @@ Craigslist Computer Gigs Monitor — Patched for GitHub IP throttling
 import html
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,22 @@ SEEN_FILE = ROOT / "data" / "seen.json"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 # GitHub passes a missing secret as an empty string, so fall back on empty too.
 # onboarding@resend.dev only delivers to the Resend account's own address.
-FROM_EMAIL = (os.environ.get("FROM_EMAIL") or "").strip() or "COAI Gig Monitor <onboarding@resend.dev>"
+DEFAULT_FROM = "COAI Gig Monitor <onboarding@resend.dev>"
+_SENDER = re.compile(r"^(?:[^<>@]+<)?[^\s<>@\"']+@[^\s<>@\"']+\.[^\s<>@\"']+>?$")
+
+
+def pick_sender(raw):
+    """Resend wants email@example.com or Name <email@example.com>. A blank or
+    malformed FROM_EMAIL secret would make every send fail, so use the default."""
+    val = (raw or "").strip().strip('"').strip("'").strip()
+    if val and _SENDER.match(val) and (val.endswith(">") == ("<" in val)):
+        return val
+    if val:
+        print("WARN: FROM_EMAIL secret is not a valid sender address; using the default sender")
+    return DEFAULT_FROM
+
+
+FROM_EMAIL = pick_sender(os.environ.get("FROM_EMAIL"))
 ALERT_EMAIL = os.environ.get("ALERT_EMAIL")
 ALERT_SMS_GATEWAY = os.environ.get("ALERT_SMS_GATEWAY")
 
