@@ -113,9 +113,11 @@ def main():
     posts = real.parse_search(sample)
     expect = [
         ("7995269400", "Paid Study | Test AI & Earn Up to $600 | Remote",
-         "https://www.craigslist.org/view/d/bakersfield-paid-study-test-ai-earn-up/pFj49JDuWsS8HbrnrcMxj6", ""),
+         "https://www.craigslist.org/view/d/bakersfield-paid-study-test-ai-earn-up/pFj49JDuWsS8HbrnrcMxj6", "",
+         1793822479),
         ("7991554056", "Website Needed",
-         "https://www.craigslist.org/view/d/bakersfield-website-needed/5L68WoyHJ9MLG4GdtNqvDH", ""),
+         "https://www.craigslist.org/view/d/bakersfield-website-needed/5L68WoyHJ9MLG4GdtNqvDH", "",
+         1793224492),
     ]
     if posts != expect:
         failures.append(f"parse_search gave {posts}")
@@ -129,5 +131,62 @@ def main():
     return 1 if failures else 0
 
 
+def age_checks():
+    """Only posts Craigslist dates within the last 2 days are emailed.
+    Posting date = minPostedDate plus each item's second field. In the sample
+    (captured Nov 9 2026) that puts the two posts on Nov 4 and Oct 28, inside
+    Craigslist's 30-day window that starts at minPostedDate (Oct 11)."""
+    import importlib
+    failures = []
+    tmp = Path(tempfile.mkdtemp())
+    real = importlib.reload(monitor)
+    real.SEEN_FILE, real.CITIES_FILE = tmp / "seen.json", tmp / "cities.json"
+    real.CITIES_FILE.write_text(json.dumps([{"name": "Reno", "slug": "reno"}, {"name": "Fresno", "slug": "fresno"}]))
+    real.SEEN_FILE.write_text(json.dumps({"reno": {}, "fresno": {}}))
+    real.time.sleep = lambda s: None
+    now = real._now()
+    fresh = ("n1", "Need a website for my salon", "https://www.craigslist.org/view/d/x/n1",
+             "Small salon in Reno.", now - 3600)
+    stale = ("n2", "Need an app built for my gym", "https://www.craigslist.org/view/d/x/n2",
+             "Gym in Fresno.", now - 3 * 86400)
+    sent = []
+    real.fetch_feed = lambda slug: {"reno": [fresh], "fresno": [stale]}.get(slug)
+    real.send_digest = lambda leads: sent.extend(leads) or True
+    real.main()
+    if [p["title"] for p in sent] != ["Need a website for my salon"]:
+        failures.append(f"2-day limit: expected only the fresh post, sent {[p['title'] for p in sent]}")
+
+    # A kept lead (from a failed email) older than 2 days is dropped, not re-sent.
+    old_lead = {"city": "Reno", "slug": "reno", "title": "Need a site", "link": "https://x", "desc": "",
+                "tier": "hot", "key": "old-site", "found": now - 3600, "posted": now - 3 * 86400}
+    new_lead = dict(old_lead, title="Need a site today", key="new-site", posted=now - 3600)
+    real.SEEN_FILE.write_text(json.dumps({"reno": {}, "fresno": {}, "_pending": [old_lead, new_lead]}))
+    sent = []
+    real.fetch_feed = lambda slug: []
+    real.main()
+    if [p["title"] for p in sent] != ["Need a site today"]:
+        failures.append(f"kept lead older than 2 days was not dropped (sent {[p['title'] for p in sent]})")
+
+    # No date at all is not treated as old.
+    if real.too_old({}) or real.too_old({"posted": None}) or not real.too_old({"posted": now - 49 * 3600}):
+        failures.append("too_old mishandles missing or old dates")
+
+    # The email shows how long ago each post went up.
+    captured = {}
+    real = importlib.reload(monitor)
+    real.send_email = lambda subj, body: captured.setdefault("body", body)
+    real.send_sms = lambda text: None
+    real.send_digest([{"city": "Reno", "tier": "hot", "title": "Site needed",
+                       "link": "https://x", "posted": real._now() - 5 * 3600}])
+    if "5h ago" not in captured.get("body", ""):
+        failures.append("email does not show how long ago the post went up")
+
+    for f in failures:
+        print("FAIL", f)
+    total = 4
+    print(f"{total - len(failures)}/{total} post-age checks passed")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(max(main(), age_checks()))
