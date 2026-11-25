@@ -9,6 +9,8 @@ Craigslist Computer Gigs Monitor — Patched for GitHub IP throttling
 - Still uses data/cities.json → data/seen.json → Resend email/SMS
 - seen.json keeps {post id: first seen} per city for 60 days, plus the text
   keys of posts already emailed, so old and cross-posted ads never repeat
+- Only posts Craigslist dates within the last 2 days are emailed
+  (MAX_POST_AGE_HOURS); older buyers have usually hired someone already
 """
 import html
 import json
@@ -36,12 +38,31 @@ REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 4.0  # bumped from 1.5 to avoid Craigslist throttling GH Actions IPs
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; COAI-GigMonitor/1.0)"}
 SEEN_DAYS = 60  # forget a post this many days after we first saw it (gig posts expire sooner)
+MAX_POST_AGE_HOURS = 48  # only email posts Craigslist dates within this many hours
 KEYS = "_alerted"  # dedupe keys already emailed, so cross-posts never repeat
 PENDING = "_pending"  # leads whose email failed, retried next run
 
 
 def _now():
     return int(time.time())
+
+
+def too_old(post, now=None):
+    """True when the post (or a kept lead) is older than MAX_POST_AGE_HOURS.
+    Uses Craigslist's posting date; a kept lead from before that date was
+    stored falls back to when we found it. No date at all is not too old."""
+    ts = post.get("posted") or post.get("found")
+    if not isinstance(ts, (int, float)):
+        return False
+    return (now or _now()) - ts > MAX_POST_AGE_HOURS * 3600
+
+
+def _age(post, now=None):
+    ts = post.get("posted")
+    if not isinstance(ts, (int, float)):
+        return ""
+    hours = max(0, int(((now or _now()) - ts) // 3600))
+    return f"{hours}h ago" if hours < 48 else f"{hours // 24}d ago"
 
 
 def normalize_seen(seen):
@@ -108,7 +129,10 @@ def parse_search(payload):
     element is the title. The search results carry no description.
     """
     data = (payload or {}).get("data") or {}
-    base_id = (data.get("decode") or {}).get("minPostingId") or 0
+    decode = data.get("decode") or {}
+    base_id = decode.get("minPostingId") or 0
+    # Each item's second field is its posting time in seconds after minPostedDate.
+    base_date = decode.get("minPostedDate")
     items = []
     for it in data.get("items") or []:
         if not isinstance(it, list) or not it:
@@ -120,7 +144,10 @@ def parse_search(payload):
             continue
         guid = str(base_id + it[0])
         link = f"https://www.craigslist.org/view/d/{slug}/{token}"
-        items.append((guid, title.strip(), link, ""))
+        posted = None
+        if isinstance(base_date, int) and len(it) > 1 and isinstance(it[1], int):
+            posted = base_date + it[1]
+        items.append((guid, title.strip(), link, "", posted))
     return items
 
 
@@ -177,6 +204,10 @@ def main():
     if not isinstance(pending, list):
         pending = []
     pending = [p for p in pending if isinstance(p, dict) and p.get("key") and p.get("tier")]
+    stale = [p for p in pending if too_old(p)]
+    if stale:
+        print(f"Dropped {len(stale)} kept lead(s) older than {MAX_POST_AGE_HOURS}h")
+    pending = [p for p in pending if not too_old(p)]
     seen = prune_seen(normalize_seen(raw))
     alerted = seen.pop(KEYS, {})
     print(f"Loaded {len(cities)} cities from {CITIES_FILE}, {len(seen)} cities in seen.json")
@@ -210,14 +241,15 @@ def main():
             continue
         first_visit = slug not in seen
         city_seen = seen.setdefault(slug, {})
-        for guid, title, link, desc in items:
+        for guid, title, link, desc, *extra in items:
             if guid in city_seen:
                 continue
             city_seen[guid] = _now()
             # First visit to a city only records what is already up, so a fresh
             # or reset seen.json never floods the inbox with old posts.
             if not first_visit:
-                new_posts.append({"city": name, "slug": slug, "title": title, "link": link, "desc": desc})
+                new_posts.append({"city": name, "slug": slug, "title": title, "link": link,
+                                  "desc": desc, "posted": extra[0] if extra else None})
         if idx % 20 == 0:
             print(f"  ... progress {idx}/{len(cities)}, new so far: {len(new_posts)}, blocked: {blocked}")
 
@@ -260,6 +292,9 @@ def pick_leads(new_posts, alerted):
     cross-posted to another city, now or in an earlier run) is skipped."""
     leads, dropped, batch = [], {}, set()
     for p in new_posts:
+        if too_old(p):
+            dropped["older than 2 days"] = dropped.get("older than 2 days", 0) + 1
+            continue
         key = dedupe_key(p["title"], p.get("desc", ""))
         if key in alerted or key in batch:
             dropped["already sent"] = dropped.get("already sent", 0) + 1
@@ -290,9 +325,10 @@ def send_digest(new_posts):
     rows = "".join(
         f'<tr><td style="padding:6px 10px;border-bottom:1px solid #333;">{html.escape(p["city"])}</td>'
         f'<td style="padding:6px 10px;border-bottom:1px solid #333;">{p["tier"].upper()}</td>'
-        f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{html.escape(_safe_link(p["link"]))}">{html.escape(p["title"])}</a></td></tr>'
+        f'<td style="padding:6px 10px;border-bottom:1px solid #333;"><a href="{html.escape(_safe_link(p["link"]))}">{html.escape(p["title"])}</a></td>'
+        f'<td style="padding:6px 10px;border-bottom:1px solid #333;">{_age(p)}</td></tr>'
         for p in new_posts)
-    html_body = f"<h2>{len(new_posts)} buyer post(s) on Craigslist computer gigs</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Tier</th><th style=\"text-align:left;padding:6px 10px;\">Post</th></tr>{rows}</table>"
+    html_body = f"<h2>{len(new_posts)} buyer post(s) on Craigslist computer gigs</h2><table style=\"border-collapse:collapse;width:100%;font-family:sans-serif;\"><tr><th style=\"text-align:left;padding:6px 10px;\">City</th><th style=\"text-align:left;padding:6px 10px;\">Tier</th><th style=\"text-align:left;padding:6px 10px;\">Post</th><th style=\"text-align:left;padding:6px 10px;\">Posted</th></tr>{rows}</table>"
     ok = send_email(f"COAI Gig Monitor: {len(new_posts)} buyer post(s)", html_body)
     top = new_posts[:3]
     sms_lines = [f"{len(new_posts)} buyer post(s)."] + [f"{p['city']}: {p['title'][:40]}" for p in top]
